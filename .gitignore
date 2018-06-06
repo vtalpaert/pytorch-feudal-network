@@ -1,0 +1,4 @@
+*.pyc
+
+# IDE
+.idea/
