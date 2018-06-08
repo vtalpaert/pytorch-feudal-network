@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
+
+
+def d_cos(alpha, beta):
+    return alpha.transpose() @ beta / (alpha.norm() * beta.norm())
 
 
 class View(nn.Module):
@@ -10,14 +13,13 @@ class View(nn.Module):
         self.shape = shape
 
     def forward(self, x):
-        print("Flatten", x.size())
-        return x.view(x.size()[0], **self.shape)
+        return x.view(x.size()[0], *self.shape)
 
 
 class dLSTM(nn.Module):
-    def __init__(self, r, input_size, hidden_size, num_layers=1):
+    def __init__(self, r, input_size, hidden_size):
         super(dLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers)
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.hidden = [None for _ in range(r)]
         self.out = [None for _ in range(r)]
         self.tick = 0
@@ -31,8 +33,12 @@ class dLSTM(nn.Module):
 
 
 class FuN(nn.Module):
-    def __init__(self, in_channels, action_space, d=256, k=16, c=10):
+    def __init__(self, observation_space, action_space, d=256, k=16, c=10):
         super(FuN, self).__init__()
+
+        # Note that in Pytorch images are : batch x C x H x W
+        # but in gym a Box.shape for an image is (H, W, C)
+        height, width, channels = observation_space.shape
 
         if action_space.__class__.__name__ == "Discrete":
             num_outputs = action_space.n
@@ -45,13 +51,14 @@ class FuN(nn.Module):
         else:
             raise NotImplementedError
 
+        percept_linear_in = 32 * int((int((height - 4) / 4) - 2) / 2) * int((int((width - 4) / 4) - 2) / 2)
         self.f_percept = nn.Sequential(
-            nn.Conv2d(in_channels, 16, (8, 8), stride=4),
+            nn.Conv2d(channels, 16, (8, 8), stride=4),
             nn.ReLU(),
             nn.Conv2d(16, 32, (4, 4), stride=2),
             nn.ReLU(),
-            View((-1,)),
-            nn.Linear(32 * 4 * 4, d),  # TODO: input layer
+            View((1, percept_linear_in,)),
+            nn.Linear(percept_linear_in, d),
             nn.ReLU()
         )
 
@@ -61,37 +68,51 @@ class FuN(nn.Module):
         )
 
         self.f_Mrnn = dLSTM(c, d, d)
-        self.f_Wrnn = nn.LSTM(d, num_outputs * k)
+
+        self.f_Wrnn = nn.LSTM(d, num_outputs * k, batch_first=True)
         self.W_hidden = None  # worker's hidden state
 
-        self.stack_to_action = View((num_outputs, k))
+        self.view_as_actions = View((k, num_outputs))
 
         self.phi = nn.Linear(d, k, bias=False)
 
     def forward(self, x):
-        ## perception
-        # shared intermediate representation [d]
-        z = self.f_percept(x)
+        # perception
+        z = self.f_percept(x)  # shared intermediate representation [batch x d]
 
-        ## Manager
-        # latent state representation [d]
-        s = self.f_Mspace(z)
-        # goal [d]
-        g = self.f_Mrnn(s)
+        # Manager
+        s = self.f_Mspace(z)  # latent state representation [batch x 1 x d]
+        g = self.f_Mrnn(s)  # goal [batch x 1 x d]
 
         # Reset the gradient for the Worker's goal
         g_W = g.detach()
         g_W.requires_grad = g.requires_grad
         # g_W is a copy of g without the computation history
 
-        # projection [k x 1]
-        w = self.phi(g_W)
+        w = self.phi(g_W)  # projection [ batch x 1 x k]
 
         # Worker
         U_flat, self.W_hidden = self.f_Wrnn(z, self.W_hidden)
-        U = self.stack_to_action(U_flat)  # [n x a x k)]
+        U = self.view_as_actions(U_flat)  # [batch x k x a]
 
-        a = (U @ w)
-        a = a.view(a.size()[0])  # action [a]
+        a = (w @ U)  # [batch x 1 x a)]
 
-        return F.softmax(a)
+        return F.softmax(a, dim=2)
+
+
+def test_forward():
+    from gym.spaces import Box
+
+    batch = 4
+    actions = 6
+    for height in range(128, 513):
+        for width in range(128, 513):
+            observation_space = Box(0, 255, [height, width, 3])
+            fun = FuN(observation_space, actions)
+
+            image_batch = torch.randn(batch, 3, height, width)
+            print(fun(image_batch))
+
+
+if __name__ == "__main__":
+    test_forward()
