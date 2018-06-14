@@ -3,8 +3,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def d_cos(alpha, beta):
-    return alpha.transpose() @ beta / (alpha.norm() * beta.norm())
+def d_cos(alpha, beta, batch_size=None):
+    """inputs are size batch x 1 x d"""
+    if batch_size is None:
+        batch_size = alpha.size(0)
+        assert(batch_size == beta.size(0))
+    out = torch.zeros(batch_size, 1)
+    norms = alpha.norm(dim=2) * beta.norm(dim=2)
+    for batch in range(batch_size):
+        norm = norms[batch]
+        if norm:
+            out[batch, 0] = alpha[batch, 0].dot(beta[batch, 0]) / norm
+        else:
+            out[batch, 0] = 0
+    return out
 
 
 class View(nn.Module):
@@ -20,16 +32,48 @@ class dLSTM(nn.Module):
     def __init__(self, r, input_size, hidden_size):
         super(dLSTM, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
-        self.hidden = [None for _ in range(r)]
-        self.out = [None for _ in range(r)]
-        self.tick = 0
         self.r = r
         self.my_filter = lambda tensor: tensor is not None
+        self.reset()
+
+    def reset(self):
+        # TODO use one tensor instead of list, tbd when already working fine
+        self.hidden = [None for _ in range(self.r)]
+        self.out = [None for _ in range(self.r)]
+        self.tick = 0
 
     def forward(self, inputs):
         self.out[self.tick], self.hidden[self.tick] = self.lstm(inputs, self.hidden[self.tick])
         self.tick = (self.tick + 1) % self.r
         return sum(filter(self.my_filter, self.out))
+
+
+class dLSTMrI(dLSTM):
+    """dLSTM with intrinsic reward"""
+    def __init__(self, r, input_size, hidden_size):
+        super(dLSTMrI, self).__init__(r, input_size, hidden_size)
+
+    def reset(self):
+        super(dLSTMrI, self).reset()
+        self.input = [None for _ in range(self.r)]
+
+    def forward(self, inputs):
+        self.input[self.tick] = inputs
+        return super(dLSTMrI, self).forward(inputs)
+
+    def intrinsic_reward(self):
+        t = (self.tick - 1) % self.r
+        rI = 0
+        s_t = self.input[t]
+        if s_t is None:
+            print("No recorded input")
+            return 0
+        for i in range(1, self.r):
+            s_t_i = self.input[(t - i) % self.r]
+            g_t_i = self.out[(t - i) % self.r]
+            if s_t_i is not None and g_t_i is not None:
+                rI += d_cos(s_t - s_t_i, g_t_i)
+        return rI / self.r
 
 
 class FuN(nn.Module):
@@ -67,7 +111,7 @@ class FuN(nn.Module):
             nn.ReLU()
         )
 
-        self.f_Mrnn = dLSTM(c, d, d)
+        self.f_Mrnn = dLSTMrI(c, d, d)
 
         self.f_Wrnn = nn.LSTM(d, num_outputs * k, batch_first=True)
         self.W_hidden = None  # worker's hidden state
@@ -97,21 +141,26 @@ class FuN(nn.Module):
 
         a = (w @ U)  # [batch x 1 x a)]
 
-        return F.softmax(a, dim=2)
+        return F.softmax(a, dim=2), g
+
+    def _intrinsic_reward(self):
+        return self.f_Mrnn.intrinsic_reward()
 
 
 def test_forward():
     from gym.spaces import Box
 
     batch = 4
-    actions = 6
-    for height in range(128, 513):
-        for width in range(128, 513):
-            observation_space = Box(0, 255, [height, width, 3])
-            fun = FuN(observation_space, actions)
+    action_space = 6
+    height = 128
+    width = 128
+    observation_space = Box(0, 255, [height, width, 3])
+    fun = FuN(observation_space, action_space)
 
-            image_batch = torch.randn(batch, 3, height, width)
-            print(fun(image_batch))
+    for _ in range(10):
+        image_batch = torch.randn(batch, 3, height, width)
+        action, goal = fun(image_batch)
+        print(fun._intrinsic_reward())
 
 
 if __name__ == "__main__":
