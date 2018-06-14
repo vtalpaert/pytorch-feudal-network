@@ -62,30 +62,35 @@ class dLSTM(nn.Module):
         self.lstm = LSTMCell(input_size, hidden_size)
         self.r = r
         self.my_filter = lambda tensor: tensor is not None
-        self.reset()
 
-    def reset(self):
+    def init_state(self):
         # TODO use one tensor instead of list, tbd when already working fine
         # TODO or use a mask over one big tensor
-        self.hidden = [None for _ in range(self.r)]
-        self.out = [None for _ in range(self.r)]
-        self.tick = 0
+        hidden = [None for _ in range(self.r)]
+        out = [None for _ in range(self.r)]
+        tick = 0
+        return tick, out, hidden
 
-    def forward(self, inputs):
-        self.out[self.tick], c_x = self.lstm(inputs, self.hidden[self.tick])
-        self.hidden[self.tick] = self.out[self.tick], c_x
-        self.tick = (self.tick + 1) % self.r
-        return sum(filter(self.my_filter, self.out))
+    def forward(self, inputs, states):
+        tick, out, hidden = states
+        out[tick], c_x = self.lstm(inputs, hidden[tick])
+        hidden[tick] = out[tick], c_x
+        tick = (tick + 1) % self.r
+        new_states = (tick, out, hidden)
+        g_t = sum(filter(self.my_filter, out))
+        return g_t, new_states
 
 
+'''
 class dLSTMrI(dLSTM):
     """dLSTM with intrinsic reward"""
     def __init__(self, r, input_size, hidden_size):
         super(dLSTMrI, self).__init__(r, input_size, hidden_size)
 
-    def reset(self):
-        super(dLSTMrI, self).reset()
-        self.inputs = [None for _ in range(self.r)]
+    def init_state(self):
+        tick, out, hidden = super(dLSTMrI, self).init_state()
+        inputs = [None for _ in range(self.r)]
+        return tick, out, hidden, stacked_inputs
 
     def forward(self, inputs):
         self.inputs[self.tick] = inputs
@@ -103,6 +108,7 @@ class dLSTMrI(dLSTM):
             if s_t_i is not None and g_t_i is not None:
                 rI += d_cos(s_t - s_t_i, g_t_i)
         return rI / self.r
+'''
 
 
 class FuN(nn.Module):
@@ -140,10 +146,9 @@ class FuN(nn.Module):
             nn.ReLU()
         )
 
-        self.f_Mrnn = dLSTMrI(c, d, d)
+        self.f_Mrnn = dLSTM(c, d, d)
 
         self.f_Wrnn = LSTMCell(d, num_outputs * k)
-        self.W_hidden = None  # worker's hidden state
 
         self.view_as_actions = View((k, num_outputs))
 
@@ -152,13 +157,15 @@ class FuN(nn.Module):
             View((1, k))
         )
 
-    def forward(self, x):
+    def forward(self, x, states):
+        W_hidden, M_states = states
+
         # perception
         z = self.f_percept(x)  # shared intermediate representation [batch x d]
 
         # Manager
         s = self.f_Mspace(z)  # latent state representation [batch x d]
-        g = self.f_Mrnn(s)  # goal [batch x d]
+        g, M_states = self.f_Mrnn(s, M_states)  # goal [batch x d]
 
         # Reset the gradient for the Worker's goal
         g_W = g.detach()
@@ -168,20 +175,16 @@ class FuN(nn.Module):
         w = self.phi(g_W)  # projection [ batch x 1 x k]
 
         # Worker
-        U_flat, c_x = self.f_Wrnn(z, self.W_hidden)
-        self.W_hidden = U_flat, c_x
+        U_flat, c_x = self.f_Wrnn(z, W_hidden)
+        W_hidden = U_flat, c_x
         U = self.view_as_actions(U_flat)  # [batch x k x a]
 
         a = (w @ U).squeeze()  # [batch x a)]
 
-        return F.softmax(a, dim=1), g
+        return a, g, (W_hidden, M_states)
 
-    def reset(self):
-        self.W_hidden = None
-        self.f_Mrnn.reset()
-
-    def _intrinsic_reward(self):
-        return self.f_Mrnn.intrinsic_reward()
+    def init_state(self):
+        return None, self.f_Mrnn.init_state()
 
 
 def test_forward():
@@ -193,11 +196,12 @@ def test_forward():
     width = 128
     observation_space = Box(0, 255, [height, width, 3])
     fun = FuN(observation_space, action_space)
+    states = fun.init_state()
 
     for i in range(10):
         image_batch = torch.randn(batch, 3, height, width)
-        action, goal = fun(image_batch)
-        print(i, "th rewards are ", fun._intrinsic_reward())
+        action, goal, states = fun(image_batch, states)
+        #print(i, "th rewards are ", fun._intrinsic_reward())
 
 
 if __name__ == "__main__":
