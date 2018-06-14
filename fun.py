@@ -38,6 +38,7 @@ class dLSTM(nn.Module):
 
     def reset(self):
         # TODO use one tensor instead of list, tbd when already working fine
+        # TODO or use a mask over one big tensor
         self.hidden = [None for _ in range(self.r)]
         self.out = [None for _ in range(self.r)]
         self.tick = 0
