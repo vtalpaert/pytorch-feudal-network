@@ -4,34 +4,62 @@ import torch.nn.functional as F
 
 
 def d_cos(alpha, beta, batch_size=None):
-    """inputs are size batch x 1 x d"""
+    """Cosine similarity between two vectors
+    Inputs:
+        vectors are size batch x d
+    """
     if batch_size is None:
         batch_size = alpha.size(0)
         assert(batch_size == beta.size(0))
     out = torch.zeros(batch_size, 1)
-    norms = alpha.norm(dim=2) * beta.norm(dim=2)
+    norms = alpha.norm(dim=1) * beta.norm(dim=1)
     for batch in range(batch_size):
         norm = norms[batch]
         if norm:
-            out[batch, 0] = alpha[batch, 0].dot(beta[batch, 0]) / norm
+            out[batch, 0] = alpha[batch].dot(beta[batch]) / norm
         else:
             out[batch, 0] = 0
     return out
 
 
 class View(nn.Module):
+    """Layer changing the tensor shape
+    Assumes batch first tensors
+    Args:
+        the output shape without providing the batch size
+    """
     def __init__(self, shape):
         super(View, self).__init__()
         self.shape = shape
 
     def forward(self, x):
-        return x.view(x.size()[0], *self.shape)
+        return x.view(x.size(0), *self.shape)
+
+
+class LSTMCell(nn.LSTMCell):
+    """Regular LSTMCell class
+    If `(h_0, c_0)` is not provided, both **h_0** and **c_0** default to zero.
+
+    (Behaviour not working contrary to nn.LSTMCell documentation's promise)
+    """
+    def forward(self, inputs, hidden):
+        if hidden is None:
+            batch_size = inputs.size(0)
+            hidden = (
+                torch.zeros(batch_size, self.hidden_size),
+                torch.zeros(batch_size, self.hidden_size)
+            )
+        return super(LSTMCell, self).forward(inputs, hidden)
 
 
 class dLSTM(nn.Module):
+    """Implements the dilated LSTM
+    Uses a cyclic buffer of size r to keep r independent hidden states,
+    but the final output is the sum on the r intermediary outputs
+    """
     def __init__(self, r, input_size, hidden_size):
         super(dLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.lstm = LSTMCell(input_size, hidden_size)
         self.r = r
         self.my_filter = lambda tensor: tensor is not None
         self.reset()
@@ -44,7 +72,8 @@ class dLSTM(nn.Module):
         self.tick = 0
 
     def forward(self, inputs):
-        self.out[self.tick], self.hidden[self.tick] = self.lstm(inputs, self.hidden[self.tick])
+        self.out[self.tick], c_x = self.lstm(inputs, self.hidden[self.tick])
+        self.hidden[self.tick] = self.out[self.tick], c_x
         self.tick = (self.tick + 1) % self.r
         return sum(filter(self.my_filter, self.out))
 
@@ -56,21 +85,20 @@ class dLSTMrI(dLSTM):
 
     def reset(self):
         super(dLSTMrI, self).reset()
-        self.input = [None for _ in range(self.r)]
+        self.inputs = [None for _ in range(self.r)]
 
     def forward(self, inputs):
-        self.input[self.tick] = inputs
+        self.inputs[self.tick] = inputs
         return super(dLSTMrI, self).forward(inputs)
 
     def intrinsic_reward(self):
         t = (self.tick - 1) % self.r
-        rI = 0
-        s_t = self.input[t]
+        s_t = self.inputs[t]
         if s_t is None:
-            print("No recorded input")
-            return 0
+            raise ValueError("No recorded input")
+        rI = torch.zeros(s_t.size(0), 1)
         for i in range(1, self.r):
-            s_t_i = self.input[(t - i) % self.r]
+            s_t_i = self.inputs[(t - i) % self.r]
             g_t_i = self.out[(t - i) % self.r]
             if s_t_i is not None and g_t_i is not None:
                 rI += d_cos(s_t - s_t_i, g_t_i)
@@ -102,7 +130,7 @@ class FuN(nn.Module):
             nn.ReLU(),
             nn.Conv2d(16, 32, (4, 4), stride=2),
             nn.ReLU(),
-            View((1, percept_linear_in,)),
+            View((percept_linear_in,)),
             nn.Linear(percept_linear_in, d),
             nn.ReLU()
         )
@@ -114,20 +142,23 @@ class FuN(nn.Module):
 
         self.f_Mrnn = dLSTMrI(c, d, d)
 
-        self.f_Wrnn = nn.LSTM(d, num_outputs * k, batch_first=True)
+        self.f_Wrnn = LSTMCell(d, num_outputs * k)
         self.W_hidden = None  # worker's hidden state
 
         self.view_as_actions = View((k, num_outputs))
 
-        self.phi = nn.Linear(d, k, bias=False)
+        self.phi = nn.Sequential(
+            nn.Linear(d, k, bias=False),
+            View((1, k))
+        )
 
     def forward(self, x):
         # perception
         z = self.f_percept(x)  # shared intermediate representation [batch x d]
 
         # Manager
-        s = self.f_Mspace(z)  # latent state representation [batch x 1 x d]
-        g = self.f_Mrnn(s)  # goal [batch x 1 x d]
+        s = self.f_Mspace(z)  # latent state representation [batch x d]
+        g = self.f_Mrnn(s)  # goal [batch x d]
 
         # Reset the gradient for the Worker's goal
         g_W = g.detach()
@@ -137,12 +168,17 @@ class FuN(nn.Module):
         w = self.phi(g_W)  # projection [ batch x 1 x k]
 
         # Worker
-        U_flat, self.W_hidden = self.f_Wrnn(z, self.W_hidden)
+        U_flat, c_x = self.f_Wrnn(z, self.W_hidden)
+        self.W_hidden = U_flat, c_x
         U = self.view_as_actions(U_flat)  # [batch x k x a]
 
-        a = (w @ U)  # [batch x 1 x a)]
+        a = (w @ U).squeeze()  # [batch x a)]
 
-        return F.softmax(a, dim=2), g
+        return F.softmax(a, dim=1), g
+
+    def reset(self):
+        self.W_hidden = None
+        self.f_Mrnn.reset()
 
     def _intrinsic_reward(self):
         return self.f_Mrnn.intrinsic_reward()
@@ -158,10 +194,10 @@ def test_forward():
     observation_space = Box(0, 255, [height, width, 3])
     fun = FuN(observation_space, action_space)
 
-    for _ in range(10):
+    for i in range(10):
         image_batch = torch.randn(batch, 3, height, width)
         action, goal = fun(image_batch)
-        print(fun._intrinsic_reward())
+        print(i, "th rewards are ", fun._intrinsic_reward())
 
 
 if __name__ == "__main__":
