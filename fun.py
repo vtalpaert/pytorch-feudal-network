@@ -1,6 +1,7 @@
+from collections import namedtuple
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def d_cos(alpha, beta, batch_size=None):
@@ -111,11 +112,17 @@ class dLSTMrI(dLSTM):
 '''
 
 
+SavedAction = namedtuple('SavedAction', ['log_prob', 'value'])
+
+
 class FuN(nn.Module):
     def __init__(self, observation_space, action_space, d=256, k=16, c=10):
         super(FuN, self).__init__()
 
-        # Note that in Pytorch images are : batch x C x H x W
+        self.saved_actions = []
+        self.rewards = []
+
+        # Note that we expect input in Pytorch images' style : batch x C x H x W
         # but in gym a Box.shape for an image is (H, W, C)
         height, width, channels = observation_space.shape
 
@@ -157,6 +164,8 @@ class FuN(nn.Module):
             View((1, k))
         )
 
+        self.value = nn.Linear(d, 1)
+
     def forward(self, x, states):
         W_hidden, M_states = states
 
@@ -181,7 +190,7 @@ class FuN(nn.Module):
 
         a = (w @ U).squeeze()  # [batch x a)]
 
-        return a, g, (W_hidden, M_states)
+        return self.value(z), a, g, (W_hidden, M_states)
 
     def init_state(self):
         return None, self.f_Mrnn.init_state()
