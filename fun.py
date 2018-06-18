@@ -170,6 +170,8 @@ class Worker(nn.Module):
             View((1, k))
         )
 
+        self.value_function = nn.Linear(num_outputs * k, 1)
+
     def reset_states_grad(self, states):
         return reset_grad2(states)
 
@@ -196,7 +198,9 @@ class Worker(nn.Module):
 
         probs = F.softmax(a, dim=1)
 
-        return probs, states_W
+        value = self.value_function(U_flat)
+
+        return value, probs, states_W
 
 
 class Manager(nn.Module):
@@ -211,13 +215,17 @@ class Manager(nn.Module):
 
         self.f_Mrnn = dLSTM(c, d, d)
 
+        self.value_function = nn.Linear(d, 1)
+
     def forward(self, z, states_M):
         s = self.f_Mspace(z)  # latent state representation [batch x d]
         g_hat, states_M = self.f_Mrnn(s, states_M)
 
         g = F.normalize(g_hat)  # goal [batch x d]
 
-        return g, s, states_M
+        value = self.value_function(g_hat)
+
+        return value, g, s, states_M
 
     def init_state(self, batch_size):
         return self.f_Mrnn.init_state(batch_size)
@@ -237,7 +245,7 @@ class FeudalNet(nn.Module):
         elif action_space.__class__.__name__ == "Box":
             raise NotImplementedError
             # we first test this code with a softmax at the end
-            num_outputs = action_space.shape[0]
+            #num_outputs = action_space.shape[0]
         elif isinstance(action_space, int):
             num_outputs = action_space
         else:
@@ -253,16 +261,16 @@ class FeudalNet(nn.Module):
 
         z = self.perception(x)
 
-        g, s, states_M = self.manager(z, states_M)
+        value_manager, g, s, states_M = self.manager(z, states_M)
         ss[:, tick_dlstm, :] = s
 
         # sum on c different gt values, note that gt = normalize(hx)
         sum_goal = F.normalize(states_M[1][:, :, 0:1, :], dim=3).sum(dim=1)
         sum_goal_W = reset_grad2(sum_goal)
 
-        action_probs, states_W = self.worker(z, sum_goal_W, states_W)
+        value_worker, action_probs, states_W = self.worker(z, sum_goal_W, states_W)
 
-        return None, action_probs, g, (states_W, states_M, ss)
+        return value_worker, value_manager, action_probs, g, (states_W, states_M, ss)
 
     def init_state(self, batch_size):
         ss = torch.zeros(batch_size, self.c, self.d)
@@ -373,8 +381,8 @@ def test_forward():
 
     for i in range(10):
         image_batch = torch.randn(batch, 3, height, width)
-        _, action_probs, goal, states = fun(image_batch, states)
-        print(action_probs)
+        value_worker, value_manager, action_probs, goal, states = fun(image_batch, states)
+        print(value_worker, value_manager)
         #print(i, "th rewards are ", fun._intrinsic_reward())
 
 
