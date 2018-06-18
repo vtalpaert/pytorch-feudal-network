@@ -212,7 +212,9 @@ class Manager(nn.Module):
 
     def forward(self, z, states_M):
         s = self.f_Mspace(z)  # latent state representation [batch x d]
-        g, states_M = self.f_Mrnn(s, states_M)  # goal [batch x d]
+        g_hat, states_M = self.f_Mrnn(s, states_M)
+
+        g = F.normalize(g_hat)  # goal [batch x d]
 
         return g, s, states_M
 
@@ -253,7 +255,8 @@ class FeudalNet(nn.Module):
         g, s, states_M = self.manager(z, states_M)
         ss[:, tick_dlstm, :] = s
 
-        sum_goal = states_M[1][:, :, 0, :].sum(dim=1)  # sum on c different hx values
+        # sum on c different gt values, note that gt = normalize(hx)
+        sum_goal = F.normalize(states_M[1][:, :, 0, :], dim=2).sum(dim=1)
         sum_goal_W = reset_grad2(sum_goal)
 
         action_probs, states_W = self.worker(z, sum_goal_W, states_W)
@@ -352,7 +355,7 @@ def train(env, lr, num_steps, max_episode_length):
         ensure_shared_grads(model, shared_model)
 
 
-optimizer.step()
+    optimizer.step()
 
 
 
