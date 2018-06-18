@@ -2,6 +2,20 @@ from collections import namedtuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.autograd import Variable
+from torch.distributions import Categorical
+
+
+def reset_grad1(t):
+    return Variable(t.data)
+
+
+def reset_grad2(t):
+    tr = t.detach()
+    tr.requires_grad = t.requires_grad
+    return tr
 
 
 def d_cos(alpha, beta, batch_size=None):
@@ -25,16 +39,20 @@ def d_cos(alpha, beta, batch_size=None):
 
 class View(nn.Module):
     """Layer changing the tensor shape
-    Assumes batch first tensors
+    Assumes batch first tensors by default
     Args:
         the output shape without providing the batch size
     """
-    def __init__(self, shape):
+    def __init__(self, shape, batched=True):
         super(View, self).__init__()
         self.shape = shape
+        self.batched = batched
 
     def forward(self, x):
-        return x.view(x.size(0), *self.shape)
+        if self.batched:
+            return x.view(x.size(0), *self.shape)
+        else:
+            return x.view(*self.shape)
 
 
 class LSTMCell(nn.LSTMCell):
@@ -44,7 +62,7 @@ class LSTMCell(nn.LSTMCell):
     (Behaviour not working contrary to nn.LSTMCell documentation's promise)
     """
     def forward(self, inputs, hidden):
-        if hidden is None:
+        if hidden is None:  # TODO cuda
             batch_size = inputs.size(0)
             hidden = (
                 torch.zeros(batch_size, self.hidden_size),
@@ -56,30 +74,26 @@ class LSTMCell(nn.LSTMCell):
 class dLSTM(nn.Module):
     """Implements the dilated LSTM
     Uses a cyclic buffer of size r to keep r independent hidden states,
-    but the final output is the sum on the r intermediary outputs
+    the buffer is a tensor of size [batch x r x 2 x hidden_size]
     """
     def __init__(self, r, input_size, hidden_size):
         super(dLSTM, self).__init__()
         self.lstm = LSTMCell(input_size, hidden_size)
         self.r = r
-        self.my_filter = lambda tensor: tensor is not None
 
-    def init_state(self):
-        # TODO use one tensor instead of list, tbd when already working fine
-        # TODO or use a mask over one big tensor
-        hidden = [None for _ in range(self.r)]
-        out = [None for _ in range(self.r)]
+    def init_state(self, batch_size):
+        hidden = torch.zeros(batch_size, self.r, 2, self.lstm.hidden_size)
         tick = 0
-        return tick, out, hidden
+        return tick, hidden
 
     def forward(self, inputs, states):
-        tick, out, hidden = states
-        out[tick], c_x = self.lstm(inputs, hidden[tick])
-        hidden[tick] = out[tick], c_x
+        """Returns g_t, (tick, hidden)
+        hidden is [batch x r x 2 x hidden_size], we use 2 for hx, cx
+        """
+        tick, hidden = states
+        hidden[:, tick, 0, :], hidden[:, tick, 1, :] = self.lstm(inputs, (hidden[:, tick, 0, :], hidden[:, tick, 1, :]))
         tick = (tick + 1) % self.r
-        new_states = (tick, out, hidden)
-        g_t = sum(filter(self.my_filter, out))
-        return g_t, new_states
+        return hidden[:, tick, 0, :], (tick, hidden)
 
 
 '''
@@ -112,30 +126,21 @@ class dLSTMrI(dLSTM):
 '''
 
 
-SavedAction = namedtuple('SavedAction', ['log_prob', 'value'])
+class Perception(nn.Module):
+    """Returns z, the shared intermediate representation [batch x d]
+    """
 
+    def __init__(self, observation_shape, d, channel_first):
+        super(Perception, self).__init__()
+        self.channel_first = channel_first
 
-class FuN(nn.Module):
-    def __init__(self, observation_space, action_space, d=256, k=16, c=10):
-        super(FuN, self).__init__()
-
-        self.saved_actions = []
-        self.rewards = []
-
-        # Note that we expect input in Pytorch images' style : batch x C x H x W
-        # but in gym a Box.shape for an image is (H, W, C)
-        height, width, channels = observation_space.shape
-
-        if action_space.__class__.__name__ == "Discrete":
-            num_outputs = action_space.n
-        elif action_space.__class__.__name__ == "Box":
-            raise NotImplementedError
-            # we first test this code with a softmax at the end
-            num_outputs = action_space.shape[0]
-        elif isinstance(action_space, int):
-            num_outputs = action_space
+        # Note that we expect input in Pytorch images' style : batch x C x H x W (this is arg channel_first)
+        # but in gym a Box.shape for an image is (H, W, C) (use channel_first=False)
+        if channel_first:
+            channels, height, width = observation_shape
         else:
-            raise NotImplementedError
+            height, width, channels = observation_shape
+            self.view = View((channels, height, width))
 
         percept_linear_in = 32 * int((int((height - 4) / 4) - 2) / 2) * int((int((width - 4) / 4) - 2) / 2)
         self.f_percept = nn.Sequential(
@@ -148,12 +153,15 @@ class FuN(nn.Module):
             nn.ReLU()
         )
 
-        self.f_Mspace = nn.Sequential(
-            nn.Linear(d, d),
-            nn.ReLU()
-        )
+    def forward(self, x):
+        if not self.channel_first:
+            x = self.view(x)
+        return self.f_percept(x)
 
-        self.f_Mrnn = dLSTM(c, d, d)
+
+class Worker(nn.Module):
+    def __init__(self, num_outputs, d, k):
+        super(Worker, self).__init__()
 
         self.f_Wrnn = LSTMCell(d, num_outputs * k)
 
@@ -164,36 +172,188 @@ class FuN(nn.Module):
             View((1, k))
         )
 
-        self.value = nn.Linear(d, 1)
+    def reset_states_grad(self, states):
+        return reset_grad2(states)
 
-    def forward(self, x, states):
-        W_hidden, M_states = states
+    def init_state(self, batch_size):
+        return torch.zeros(batch_size, self.f_Wrnn.hidden_size)
 
-        # perception
-        z = self.f_percept(x)  # shared intermediate representation [batch x d]
-
-        # Manager
-        s = self.f_Mspace(z)  # latent state representation [batch x d]
-        g, M_states = self.f_Mrnn(s, M_states)  # goal [batch x d]
-
-        # Reset the gradient for the Worker's goal
-        g_W = g.detach()
-        g_W.requires_grad = g.requires_grad
-        # g_W is a copy of g without the computation history
-
-        w = self.phi(g_W)  # projection [ batch x 1 x k]
+    def forward(self, z, sum_g_W, states_W):
+        """
+        :param z:
+        :param sum_g_W: should not have computation history
+        :param worker_states:
+        :return:
+        """
+        w = self.phi(sum_g_W)  # projection [ batch x 1 x k]
 
         # Worker
-        U_flat, c_x = self.f_Wrnn(z, W_hidden)
-        W_hidden = U_flat, c_x
+        U_flat, c_x = states_W = self.f_Wrnn(z, states_W)
         U = self.view_as_actions(U_flat)  # [batch x k x a]
 
-        a = (w @ U).squeeze()  # [batch x a)]
+        a = (w @ U).squeeze()  # [batch x a]
 
-        return self.value(z), a, g, (W_hidden, M_states)
+        probs = F.softmax(a, dim=1)
 
-    def init_state(self):
-        return None, self.f_Mrnn.init_state()
+        return probs, states_W
+
+
+class Manager(nn.Module):
+    def __init__(self, d, c):
+        super(Manager, self).__init__()
+        self.c = c
+
+        self.f_Mspace = nn.Sequential(
+            nn.Linear(d, d),
+            nn.ReLU()
+        )
+
+        self.f_Mrnn = dLSTM(c, d, d)
+
+    def forward(self, z, states_M):
+        s = self.f_Mspace(z)  # latent state representation [batch x d]
+        g, states_M = self.f_Mrnn(s, states_M)  # goal [batch x d]
+
+        return g, s, states_M
+
+    def init_state(self, batch_size):
+        return self.f_Mrnn.init_state(batch_size)
+
+    def reset_states_grad(self, states):
+        tick, hidden = states
+        return tick, reset_grad2(hidden)
+
+
+class FeudalNet(nn.Module):
+    def __init__(self, observation_space, action_space, d=256, k=16, c=10, channel_first=True):
+        super(FeudalNet, self).__init__()
+        self.d, self.k, self.c = d, k, c
+
+        if action_space.__class__.__name__ == "Discrete":
+            num_outputs = action_space.n
+        elif action_space.__class__.__name__ == "Box":
+            raise NotImplementedError
+            # we first test this code with a softmax at the end
+            num_outputs = action_space.shape[0]
+        elif isinstance(action_space, int):
+            num_outputs = action_space
+        else:
+            raise NotImplementedError
+
+        self.perception = Perception(observation_space.shape, channel_first)
+        self.worker = Worker(num_outputs, d, k)
+        self.manager = Manager(d, c)
+
+    def forward(self, x, states):
+        states_W, states_M, ss = states
+        tick_dlstm, _ = states_M
+
+        z = self.perception(x)
+
+        g, s, states_M = self.manager(z, states_M)
+        ss[:, tick_dlstm, :] = s
+
+        sum_goal = states_M[1][:, :, 0, :].sum(dim=1)  # sum on c different hx values
+        sum_goal_W = reset_grad2(sum_goal)
+
+        action_probs, states_W = self.worker(z, sum_goal_W, states_W)
+
+        return 0, action_probs, g, (states_W, states_M)
+
+    def init_state(self, batch_size):
+        ss = torch.zeros(batch_size, self.c, self.d)
+        return self.worker.init_state(batch_size), self.manager.init_state(batch_size), ss
+
+    def reset_states_grad(self, states):
+        states_W, states_M, ss = states
+        return self.worker.reset_states_grad(states_W), self.manager.reset_states_grad(states_M), ss
+
+
+def train(env, lr, num_steps, max_episode_length):
+    model = FeudalNet(env.observation_space, env.action_space, channel_first=False)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    model.train()
+
+    obs = env.reset()
+    obs = torch.from_numpy(obs)
+    done = True
+
+    episode_length = 0
+    while True:
+        # Sync with the shared model
+        #model.load_state_dict(shared_model.state_dict())
+
+        if done:
+            states = model.init_state()
+        else:
+            states = model.reset_states_grad(states)
+
+        values = []
+        log_probs = []
+        rewards = []
+        entropies = []  # regularisation
+
+        for step in range(num_steps):
+            episode_length += 1
+            value, action_probs, goal, states = model(obs.unsqueeze(0), states)
+            m = Categorical(probs=action_probs)
+            action = m.sample()
+            log_prob = m.log_prob(action)
+            #entropy = -(log_prob * prob).sum(1, keepdim=True)
+            #entropies.append(entropy)
+
+            state, reward, done, _ = env.step(action.numpy())
+            done = done or episode_length >= max_episode_length
+            reward = max(min(reward, 1), -1)
+
+            #with lock:
+            #    counter.value += 1
+
+            if done:
+                episode_length = 0
+                obs = env.reset()
+
+            state = torch.from_numpy(obs)
+            values.append(value)
+            log_probs.append(log_prob)
+            rewards.append(reward)
+
+            if done:
+                break
+
+        R = torch.zeros(1, 1)
+        if not done:
+            value, _, _ = model((Variable(state.unsqueeze(0)), (hx, cx)))
+            R = value.data
+
+        values.append(Variable(R))
+        policy_loss = 0
+        value_loss = 0
+        R = Variable(R)
+        gae = torch.zeros(1, 1)
+        for i in reversed(range(len(rewards))):
+            R = args.gamma * R + rewards[i]
+            advantage = R - values[i]
+            value_loss = value_loss + 0.5 * advantage.pow(2)
+
+            # Generalized Advantage Estimataion
+            delta_t = rewards[i] + args.gamma * \
+                                   values[i + 1].data - values[i].data
+            gae = gae * args.gamma * args.tau + delta_t
+
+            policy_loss = policy_loss - \
+                          log_probs[i] * Variable(gae) - args.entropy_coef * entropies[i]
+
+        optimizer.zero_grad()
+
+        (policy_loss + args.value_loss_coef * value_loss).backward()
+        torch.nn.utils.clip_grad_norm(model.parameters(), args.max_grad_norm)
+
+        ensure_shared_grads(model, shared_model)
+
+
+optimizer.step()
+
 
 
 def test_forward():
