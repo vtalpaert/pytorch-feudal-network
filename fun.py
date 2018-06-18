@@ -71,6 +71,7 @@ class LSTMCell(nn.LSTMCell):
         return super(LSTMCell, self).forward(inputs, hidden)
 
 
+# TODO propagate train()
 class dLSTM(nn.Module):
     """Implements the dilated LSTM
     Uses a cyclic buffer of size r to keep r independent hidden states,
@@ -82,7 +83,7 @@ class dLSTM(nn.Module):
         self.r = r
 
     def init_state(self, batch_size):
-        hidden = torch.zeros(batch_size, self.r, 2, self.lstm.hidden_size)
+        hidden = torch.zeros(batch_size, self.r, 2, self.lstm.hidden_size, requires_grad=True)
         tick = 0
         return tick, hidden
 
@@ -96,36 +97,6 @@ class dLSTM(nn.Module):
         return hidden[:, tick, 0, :], (tick, hidden)
 
 
-'''
-class dLSTMrI(dLSTM):
-    """dLSTM with intrinsic reward"""
-    def __init__(self, r, input_size, hidden_size):
-        super(dLSTMrI, self).__init__(r, input_size, hidden_size)
-
-    def init_state(self):
-        tick, out, hidden = super(dLSTMrI, self).init_state()
-        inputs = [None for _ in range(self.r)]
-        return tick, out, hidden, stacked_inputs
-
-    def forward(self, inputs):
-        self.inputs[self.tick] = inputs
-        return super(dLSTMrI, self).forward(inputs)
-
-    def intrinsic_reward(self):
-        t = (self.tick - 1) % self.r
-        s_t = self.inputs[t]
-        if s_t is None:
-            raise ValueError("No recorded input")
-        rI = torch.zeros(s_t.size(0), 1)
-        for i in range(1, self.r):
-            s_t_i = self.inputs[(t - i) % self.r]
-            g_t_i = self.out[(t - i) % self.r]
-            if s_t_i is not None and g_t_i is not None:
-                rI += d_cos(s_t - s_t_i, g_t_i)
-        return rI / self.r
-'''
-
-
 class Perception(nn.Module):
     """Returns z, the shared intermediate representation [batch x d]
     """
@@ -137,7 +108,10 @@ class Perception(nn.Module):
         # Note that we expect input in Pytorch images' style : batch x C x H x W (this is arg channel_first)
         # but in gym a Box.shape for an image is (H, W, C) (use channel_first=False)
         height, width, channels = observation_shape
-        if not channel_first:
+        if channel_first:
+            channels, height, width = observation_shape
+        else:
+            height, width, channels = observation_shape
             self.view = View((channels, height, width))
 
         percept_linear_in = 32 * int((int((height - 4) / 4) - 2) / 2) * int((int((width - 4) / 4) - 2) / 2)
@@ -173,15 +147,16 @@ class Worker(nn.Module):
         self.value_function = nn.Linear(num_outputs * k, 1)
 
     def reset_states_grad(self, states):
-        return reset_grad2(states)
+        h, c = states
+        return reset_grad2(h), reset_grad2(c)
 
     def init_state(self, batch_size):
         return (
-            torch.zeros(batch_size, self.f_Wrnn.hidden_size),
-            torch.zeros(batch_size, self.f_Wrnn.hidden_size)
+            torch.zeros(batch_size, self.f_Wrnn.hidden_size, requires_grad=self.training),
+            torch.zeros(batch_size, self.f_Wrnn.hidden_size, requires_grad=self.training)
         )
 
-    def forward(self, z, sum_g_W, states_W):
+    def forward(self, z, sum_g_W, states_W, reset_value_grad):
         """
         :param z:
         :param sum_g_W: should not have computation history
@@ -194,11 +169,14 @@ class Worker(nn.Module):
         U_flat, c_x = states_W = self.f_Wrnn(z, states_W)
         U = self.view_as_actions(U_flat)  # [batch x k x a]
 
-        a = (w @ U).squeeze()  # [batch x a]
+        a = (w @ U).squeeze(1)  # [batch x a]
 
         probs = F.softmax(a, dim=1)
 
-        value = self.value_function(U_flat)
+        if reset_value_grad:
+            value = self.value_function(reset_grad2(U_flat))
+        else:
+            value = self.value_function(U_flat)
 
         return value, probs, states_W
 
@@ -217,13 +195,16 @@ class Manager(nn.Module):
 
         self.value_function = nn.Linear(d, 1)
 
-    def forward(self, z, states_M):
+    def forward(self, z, states_M, reset_value_grad):
         s = self.f_Mspace(z)  # latent state representation [batch x d]
         g_hat, states_M = self.f_Mrnn(s, states_M)
 
         g = F.normalize(g_hat)  # goal [batch x d]
 
-        value = self.value_function(g_hat)
+        if reset_value_grad:
+            value = self.value_function(reset_grad2(g_hat))
+        else:
+            value = self.value_function(g_hat)
 
         return value, g, s, states_M
 
@@ -255,22 +236,26 @@ class FeudalNet(nn.Module):
         self.worker = Worker(num_outputs, d, k)
         self.manager = Manager(d, c)
 
-    def forward(self, x, states):
+    def forward(self, x, states, reset_value_grad=False):
         states_W, states_M, ss = states
-        tick_dlstm, _ = states_M
+        tick_dlstm, hidden_M = states_M
 
         z = self.perception(x)
 
-        value_manager, g, s, states_M = self.manager(z, states_M)
+        s_prev = ss[:, tick_dlstm, :]
+        g_prev = F.normalize(hidden_M[:, tick_dlstm, 0, :], dim=1)
+
+        value_manager, g, s, states_M = self.manager(z, states_M, reset_value_grad)
         ss[:, tick_dlstm, :] = s
+        nabla_dcos_t_minus_c = d_cos((s - s_prev).data, g_prev)
 
         # sum on c different gt values, note that gt = normalize(hx)
         sum_goal = F.normalize(states_M[1][:, :, 0:1, :], dim=3).sum(dim=1)
         sum_goal_W = reset_grad2(sum_goal)
 
-        value_worker, action_probs, states_W = self.worker(z, sum_goal_W, states_W)
+        value_worker, action_probs, states_W = self.worker(z, sum_goal_W, states_W, reset_value_grad)
 
-        return value_worker, value_manager, action_probs, g, (states_W, states_M, ss)
+        return value_worker, value_manager, action_probs, g, nabla_dcos_t_minus_c, (states_W, states_M, ss)
 
     def init_state(self, batch_size):
         ss = torch.zeros(batch_size, self.c, self.d)
@@ -280,9 +265,34 @@ class FeudalNet(nn.Module):
         states_W, states_M, ss = states
         return self.worker.reset_states_grad(states_W), self.manager.reset_states_grad(states_M), ss
 
+    def _intrinsic_reward(self, states):
+        states_W, states_M, ss = states
+        tick, hidden_M = states_M
+        t = (tick - 1) % self.c  # tick is always ahead
+        s_t = ss[:, t, :]
+        rI = torch.zeros(s_t.size(0), 1)
+        for i in range(1, self.c):
+            t_minus_i = (t - i) % self.c
+            s_t_i = ss[:, t_minus_i, :]
+            g_t_i = F.normalize(hidden_M[:, t_minus_i, 0, :], dim=1)
+            rI += d_cos(s_t - s_t_i, g_t_i)
+        return rI / self.c
 
-def train(env, lr, num_steps, max_episode_length):
-    model = FeudalNet(env.observation_space, env.action_space, channel_first=False)
+
+def train(
+        env,
+        model,
+        lr,
+        alpha,  # intrinsic reward multiplier
+        entropy_coef,  # beta
+        tau_worker,
+        gamma_worker,
+        gamma_manager,
+        num_steps,
+        max_episode_length,
+        max_grad_norm,
+        value_worker_loss_coef=0.5,
+        value_manager_loss_coef=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     model.train()
 
@@ -292,31 +302,37 @@ def train(env, lr, num_steps, max_episode_length):
 
     episode_length = 0
     while True:
+        print("start")
         # Sync with the shared model
         #model.load_state_dict(shared_model.state_dict())
 
         if done:
-            states = model.init_state()
+            states = model.init_state(1)
         else:
             states = model.reset_states_grad(states)
 
-        values = []
+        values_worker, values_manager = [], []
         log_probs = []
-        rewards = []
+        rewards, intrinsic_rewards = [], []
         entropies = []  # regularisation
+        manager_partial_loss = []
 
         for step in range(num_steps):
             episode_length += 1
-            value, action_probs, goal, states = model(obs.unsqueeze(0), states)
+            value_worker, value_manager, action_probs, goal, nabla_dcos, states = model(obs.unsqueeze(0), states)
             m = Categorical(probs=action_probs)
             action = m.sample()
             log_prob = m.log_prob(action)
-            #entropy = -(log_prob * prob).sum(1, keepdim=True)
-            #entropies.append(entropy)
+            entropy = -(log_prob * action_probs).sum(1, keepdim=True)
+            entropies.append(entropy)
+            manager_partial_loss.append(nabla_dcos)
 
-            state, reward, done, _ = env.step(action.numpy())
+            obs, reward, done, _ = env.step(action.numpy())
+            env.render()
             done = done or episode_length >= max_episode_length
             reward = max(min(reward, 1), -1)
+            intrinsic_reward = model._intrinsic_reward(states)
+            intrinsic_reward = float(intrinsic_reward)  # TODO batch
 
             #with lock:
             #    counter.value += 1
@@ -325,46 +341,68 @@ def train(env, lr, num_steps, max_episode_length):
                 episode_length = 0
                 obs = env.reset()
 
-            state = torch.from_numpy(obs)
-            values.append(value)
+            obs = torch.from_numpy(obs)
+            values_manager.append(value_manager)
+            values_worker.append(value_worker)
             log_probs.append(log_prob)
             rewards.append(reward)
+            intrinsic_rewards.append(intrinsic_reward)
 
             if done:
                 break
 
-        R = torch.zeros(1, 1)
+        R_worker = torch.zeros(1, 1)
+        R_manager = torch.zeros(1, 1)
         if not done:
-            value, _, _ = model((Variable(state.unsqueeze(0)), (hx, cx)))
-            R = value.data
+            value_worker, value_manager, _, _, _, _ = model(obs.unsqueeze(0), states)
+            R_worker = value_worker.data
+            R_manager = value_manager.data
 
-        values.append(Variable(R))
+        values_worker.append(Variable(R_worker))
+        values_manager.append(Variable(R_manager))
         policy_loss = 0
-        value_loss = 0
-        R = Variable(R)
-        gae = torch.zeros(1, 1)
+        manager_loss = 0
+        value_manager_loss = 0
+        value_worker_loss = 0
+        gae_worker = torch.zeros(1, 1)
         for i in reversed(range(len(rewards))):
-            R = args.gamma * R + rewards[i]
-            advantage = R - values[i]
-            value_loss = value_loss + 0.5 * advantage.pow(2)
+            R_worker = gamma_worker * R_worker + rewards[i] + alpha * intrinsic_rewards[i]
+            R_manager = gamma_manager * R_manager + rewards[i]
+            advantage_worker = R_worker - values_worker[i]
+            advantage_manager = R_manager - values_manager[i]
+            value_worker_loss = value_worker_loss + 0.5 * advantage_worker.pow(2)
+            value_manager_loss = value_manager_loss + 0.5 * advantage_manager.pow(2)
 
-            # Generalized Advantage Estimataion
-            delta_t = rewards[i] + args.gamma * \
-                                   values[i + 1].data - values[i].data
-            gae = gae * args.gamma * args.tau + delta_t
+            # Generalized Advantage Estimation
+            delta_t_worker = \
+                rewards[i] \
+                + alpha * intrinsic_rewards[i]\
+                + gamma_worker * values_worker[i + 1].data \
+                - values_worker[i].data
+            gae_worker = gae_worker * gamma_worker * tau_worker + delta_t_worker
 
-            policy_loss = policy_loss - \
-                          log_probs[i] * Variable(gae) - args.entropy_coef * entropies[i]
+            policy_loss = policy_loss \
+                - log_probs[i] * gae_worker - entropy_coef * entropies[i]
+
+            if (i + model.c) < len(rewards):
+                manager_loss = manager_loss \
+                    - advantage_manager * manager_partial_loss[i + model.c]
 
         optimizer.zero_grad()
 
-        (policy_loss + args.value_loss_coef * value_loss).backward()
-        torch.nn.utils.clip_grad_norm(model.parameters(), args.max_grad_norm)
+        total_loss = policy_loss \
+            + manager_loss \
+            + value_manager_loss_coef * value_manager_loss \
+            + value_worker_loss_coef * value_worker_loss
 
-        ensure_shared_grads(model, shared_model)
+        (value_manager_loss).backward()
 
 
-    optimizer.step()
+        #total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+        #ensure_shared_grads(model, shared_model)
+        optimizer.step()
 
 
 def test_forward():
@@ -375,15 +413,15 @@ def test_forward():
     action_space = 6
     height = 128
     width = 128
-    observation_space = Box(0, 255, [height, width, 3], dtype=np.uint8)
+    observation_space = Box(0, 255, [3, height, width], dtype=np.uint8)
     fun = FeudalNet(observation_space, action_space, channel_first=True)
     states = fun.init_state(batch)
 
     for i in range(10):
-        image_batch = torch.randn(batch, 3, height, width)
-        value_worker, value_manager, action_probs, goal, states = fun(image_batch, states)
-        print(value_worker, value_manager)
-        #print(i, "th rewards are ", fun._intrinsic_reward())
+        image_batch = torch.randn(batch, 3, height, width, requires_grad=True)
+        value_worker, value_manager, action_probs, goal, nabla_dcos, states = fun(image_batch, states)
+        print("value worker", value_worker, "value manager", value_manager)
+        print("intrinsic reward", fun._intrinsic_reward(states))
 
 
 if __name__ == "__main__":
