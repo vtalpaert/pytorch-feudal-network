@@ -136,10 +136,8 @@ class Perception(nn.Module):
 
         # Note that we expect input in Pytorch images' style : batch x C x H x W (this is arg channel_first)
         # but in gym a Box.shape for an image is (H, W, C) (use channel_first=False)
-        if channel_first:
-            channels, height, width = observation_shape
-        else:
-            height, width, channels = observation_shape
+        height, width, channels = observation_shape
+        if not channel_first:
             self.view = View((channels, height, width))
 
         percept_linear_in = 32 * int((int((height - 4) / 4) - 2) / 2) * int((int((width - 4) / 4) - 2) / 2)
@@ -176,7 +174,10 @@ class Worker(nn.Module):
         return reset_grad2(states)
 
     def init_state(self, batch_size):
-        return torch.zeros(batch_size, self.f_Wrnn.hidden_size)
+        return (
+            torch.zeros(batch_size, self.f_Wrnn.hidden_size),
+            torch.zeros(batch_size, self.f_Wrnn.hidden_size)
+        )
 
     def forward(self, z, sum_g_W, states_W):
         """
@@ -242,7 +243,7 @@ class FeudalNet(nn.Module):
         else:
             raise NotImplementedError
 
-        self.perception = Perception(observation_space.shape, channel_first)
+        self.perception = Perception(observation_space.shape, d, channel_first)
         self.worker = Worker(num_outputs, d, k)
         self.manager = Manager(d, c)
 
@@ -256,12 +257,12 @@ class FeudalNet(nn.Module):
         ss[:, tick_dlstm, :] = s
 
         # sum on c different gt values, note that gt = normalize(hx)
-        sum_goal = F.normalize(states_M[1][:, :, 0, :], dim=2).sum(dim=1)
+        sum_goal = F.normalize(states_M[1][:, :, 0:1, :], dim=3).sum(dim=1)
         sum_goal_W = reset_grad2(sum_goal)
 
         action_probs, states_W = self.worker(z, sum_goal_W, states_W)
 
-        return 0, action_probs, g, (states_W, states_M)
+        return None, action_probs, g, (states_W, states_M, ss)
 
     def init_state(self, batch_size):
         ss = torch.zeros(batch_size, self.c, self.d)
@@ -358,21 +359,22 @@ def train(env, lr, num_steps, max_episode_length):
     optimizer.step()
 
 
-
 def test_forward():
     from gym.spaces import Box
+    import numpy as np
 
     batch = 4
     action_space = 6
     height = 128
     width = 128
-    observation_space = Box(0, 255, [height, width, 3])
-    fun = FuN(observation_space, action_space)
-    states = fun.init_state()
+    observation_space = Box(0, 255, [height, width, 3], dtype=np.uint8)
+    fun = FeudalNet(observation_space, action_space, channel_first=True)
+    states = fun.init_state(batch)
 
     for i in range(10):
         image_batch = torch.randn(batch, 3, height, width)
-        action, goal, states = fun(image_batch, states)
+        _, action_probs, goal, states = fun(image_batch, states)
+        print(action_probs)
         #print(i, "th rewards are ", fun._intrinsic_reward())
 
 
