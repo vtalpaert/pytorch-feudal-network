@@ -1,5 +1,3 @@
-from collections import namedtuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -74,8 +72,7 @@ class LSTMCell(nn.LSTMCell):
 # TODO propagate train()
 class dLSTM(nn.Module):
     """Implements the dilated LSTM
-    Uses a cyclic buffer of size r to keep r independent hidden states,
-    the buffer is a tensor of size [batch x r x 2 x hidden_size]
+    Uses a cyclic list of size r to keep r independent hidden states
     """
     def __init__(self, r, input_size, hidden_size):
         super(dLSTM, self).__init__()
@@ -83,18 +80,21 @@ class dLSTM(nn.Module):
         self.r = r
 
     def init_state(self, batch_size):
-        hidden = torch.zeros(batch_size, self.r, 2, self.lstm.hidden_size, requires_grad=True)
+        # note that we cannot keep the state in only one tensor as updating one place of the tensor counts
+        # as an inplace operation and breaks the gradient history
+        h0 = [torch.zeros(batch_size, self.lstm.hidden_size, requires_grad=True) for _ in range(self.r)]
+        c0 = [torch.zeros(batch_size, self.lstm.hidden_size, requires_grad=True) for _ in range(self.r)]
         tick = 0
-        return tick, hidden
+        return tick, h0, c0
 
     def forward(self, inputs, states):
         """Returns g_t, (tick, hidden)
         hidden is [batch x r x 2 x hidden_size], we use 2 for hx, cx
         """
-        tick, hidden = states
-        hidden[:, tick, 0, :], hidden[:, tick, 1, :] = self.lstm(inputs, (hidden[:, tick, 0, :], hidden[:, tick, 1, :]))
+        tick, hx, cx = states
+        out, _ = hx[tick], cx[tick] = self.lstm(inputs, (hx[tick], cx[tick]))
         tick = (tick + 1) % self.r
-        return hidden[:, tick, 0, :], (tick, hidden)
+        return out, (tick, hx, cx)
 
 
 class Perception(nn.Module):
@@ -212,8 +212,8 @@ class Manager(nn.Module):
         return self.f_Mrnn.init_state(batch_size)
 
     def reset_states_grad(self, states):
-        tick, hidden = states
-        return tick, reset_grad2(hidden)
+        tick, hx, cx = states
+        return tick, list(map(reset_grad2, hx)), list(map(reset_grad2, cx))
 
 
 class FeudalNet(nn.Module):
@@ -238,19 +238,19 @@ class FeudalNet(nn.Module):
 
     def forward(self, x, states, reset_value_grad=False):
         states_W, states_M, ss = states
-        tick_dlstm, hidden_M = states_M
+        tick_dlstm, hx_M, cx_M = states_M
 
         z = self.perception(x)
 
         s_prev = ss[:, tick_dlstm, :]
-        g_prev = F.normalize(hidden_M[:, tick_dlstm, 0, :], dim=1)
+        g_prev = F.normalize(hx_M[tick_dlstm])
 
         value_manager, g, s, states_M = self.manager(z, states_M, reset_value_grad)
         ss[:, tick_dlstm, :] = s
         nabla_dcos_t_minus_c = d_cos((s - s_prev).data, g_prev)
 
         # sum on c different gt values, note that gt = normalize(hx)
-        sum_goal = F.normalize(states_M[1][:, :, 0:1, :], dim=3).sum(dim=1)
+        sum_goal = sum(map(F.normalize, states_M[1]))
         sum_goal_W = reset_grad2(sum_goal)
 
         value_worker, action_probs, states_W = self.worker(z, sum_goal_W, states_W, reset_value_grad)
@@ -267,14 +267,14 @@ class FeudalNet(nn.Module):
 
     def _intrinsic_reward(self, states):
         states_W, states_M, ss = states
-        tick, hidden_M = states_M
+        tick, hx_M, cx_M = states_M
         t = (tick - 1) % self.c  # tick is always ahead
         s_t = ss[:, t, :]
         rI = torch.zeros(s_t.size(0), 1)
         for i in range(1, self.c):
             t_minus_i = (t - i) % self.c
             s_t_i = ss[:, t_minus_i, :]
-            g_t_i = F.normalize(hidden_M[:, t_minus_i, 0, :], dim=1)
+            g_t_i = F.normalize(hx_M[t_minus_i])
             rI += d_cos(s_t - s_t_i, g_t_i)
         return rI / self.c
 
@@ -395,10 +395,8 @@ def train(
             + value_manager_loss_coef * value_manager_loss \
             + value_worker_loss_coef * value_worker_loss
 
-        (value_manager_loss).backward()
+        total_loss.backward()
 
-
-        #total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
         #ensure_shared_grads(model, shared_model)
