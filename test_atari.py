@@ -3,7 +3,8 @@ import gym
 import numpy as np
 from gym.spaces.box import Box
 
-from fun import train, FeudalNet
+from fun import FeudalNet
+from train import train
 
 
 # Taken from https://github.com/openai/universe-starter-agent
@@ -62,7 +63,7 @@ if __name__ == "__main__":
     env = create_atari_env("PongDeterministic-v4")
     model = FeudalNet(env.observation_space, env.action_space, channel_first=True)
 
-    lr = 0.0001  # try LogUniform(1e-4.5, 1e-3.5)
+    lr = 0.001  # try LogUniform(1e-4.5, 1e-3.5)
     alpha = 0.8
     entropy_coef = 0.01
     tau_worker = 1.00
