@@ -33,6 +33,7 @@ def train(
     model = FeudalNet(env.observation_space, env.action_space, channel_first=True)
 
     if optimizer is None:
+        print("no shared optimizer")
         optimizer = optim.Adam(shared_model.parameters(), lr=args.lr)
 
     model.train()
@@ -128,6 +129,7 @@ def train(
                 - log_probs[i] * gae_worker - args.entropy_coef * entropies[i]
 
             if (i + model.c) < len(rewards):
+                # TODO try padding the manager_partial_loss with end values (or zeros)
                 manager_loss = manager_loss \
                     - advantage_manager * manager_partial_loss[i + model.c]
 
@@ -139,14 +141,14 @@ def train(
             + args.value_worker_loss_coef * value_worker_loss
 
         total_loss.backward()
-        print(
-            "Update", epoch,
-            "\ttotal_loss :", "%0.2f" % float(total_loss),
-            "\tvalue_manager_loss :", "%0.2f" % float(args.value_manager_loss_coef * value_manager_loss),
-            "\tvalue_worker_loss :", "%0.2f" % float(args.value_worker_loss_coef * value_worker_loss),
-            "\tmanager_loss :", "%0.2f" % float(manager_loss),
-            "\tpolicy_loss :", "%0.2f" % float(policy_loss)
-        )
+        #print(
+        #    "Update", epoch,
+        #    "\ttotal_loss :", "%0.2f" % float(total_loss),
+        #    "\tvalue_manager_loss :", "%0.2f" % float(args.value_manager_loss_coef * value_manager_loss),
+        #    "\tvalue_worker_loss :", "%0.2f" % float(args.value_worker_loss_coef * value_worker_loss),
+        #    "\tmanager_loss :", "%0.2f" % float(manager_loss),
+        #    "\tpolicy_loss :", "%0.2f" % float(policy_loss)
+        #)
         #plt_loss.add_value(epoch, float(args.value_manager_loss_coef * value_manager_loss), "Value Manager loss")
         #plt_loss.add_value(epoch, float(policy_loss), "Policy loss")
         #plt_loss.add_value(epoch, float(args.value_worker_loss_coef * value_worker_loss), "Value Worker loss")

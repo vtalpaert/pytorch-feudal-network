@@ -49,8 +49,9 @@ class dLSTM(nn.Module):
         """Returns g_t, (tick, hidden)
         """
         tick, hx, cx = states
-        out, _ = hx[tick], cx[tick] = self.lstm(inputs, (hx[tick], cx[tick]))
+        hx[tick], cx[tick] = self.lstm(inputs, (hx[tick], cx[tick]))
         tick = (tick + 1) % self.r
+        out = sum(hx) / self.r  # TODO verify that network output is mean of hidden states
         return out, (tick, hx, cx)
 
 
@@ -202,7 +203,7 @@ class FeudalNet(nn.Module):
                     m.reset_parameters()
         self.apply(default_init)
 
-    def forward(self, x, states, reset_value_grad=True):
+    def forward(self, x, states, reset_value_grad=False):
         states_W, states_M, ss = states
         tick_dlstm, hx_M, cx_M = states_M
 
@@ -212,8 +213,10 @@ class FeudalNet(nn.Module):
         g_prev = F.normalize(hx_M[tick_dlstm])
 
         value_manager, g, s, states_M = self.manager(z, states_M, reset_value_grad)
-        ss[tick_dlstm] = s
-        nabla_dcos_t_minus_c = self.manager_partial_loss((s - s_prev).detach(), g_prev, - torch.ones(g_prev.size(0)))
+        ss[tick_dlstm] = s.detach()
+        nabla_dcos_t_minus_c = self.manager_partial_loss((s - s_prev), g_prev, - torch.ones(g_prev.size(0)))
+
+        # TODO randomly sample g_t from a univariate Gaussian
 
         # sum on c different gt values, note that gt = normalize(hx)
         sum_goal = sum(map(F.normalize, states_M[1]))
@@ -240,7 +243,7 @@ class FeudalNet(nn.Module):
         for i in range(1, self.c):
             t_minus_i = (t - i) % self.c
             s_t_i = ss[t_minus_i]
-            g_t_i = F.normalize(hx_M[t_minus_i])
+            g_t_i = F.normalize(hx_M[t_minus_i].data)
             rI += F.cosine_similarity(s_t - s_t_i, g_t_i)
         return rI / self.c
 
