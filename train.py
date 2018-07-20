@@ -5,9 +5,10 @@ from torch.distributions import Categorical
 import torch.optim as optim
 from torch.autograd import Variable
 
-from plot import Plotter
 from fun import FeudalNet
 from envs import create_atari_env
+
+from tensorboardX import SummaryWriter
 
 
 def ensure_shared_grads(model, shared_model):
@@ -22,6 +23,7 @@ def train(
         rank,
         shared_model,
         counter,
+        log_dir,
         lock,
         optimizer,
         args):
@@ -35,6 +37,8 @@ def train(
     if optimizer is None:
         print("no shared optimizer")
         optimizer = optim.Adam(shared_model.parameters(), lr=args.lr)
+
+    writer = SummaryWriter(log_dir=log_dir)
 
     model.train()
 
@@ -141,21 +145,25 @@ def train(
             + args.value_worker_loss_coef * value_worker_loss
 
         total_loss.backward()
-        #print(
-        #    "Update", epoch,
-        #    "\ttotal_loss :", "%0.2f" % float(total_loss),
-        #    "\tvalue_manager_loss :", "%0.2f" % float(args.value_manager_loss_coef * value_manager_loss),
-        #    "\tvalue_worker_loss :", "%0.2f" % float(args.value_worker_loss_coef * value_worker_loss),
-        #    "\tmanager_loss :", "%0.2f" % float(manager_loss),
-        #    "\tpolicy_loss :", "%0.2f" % float(policy_loss)
-        #)
-        #plt_loss.add_value(epoch, float(args.value_manager_loss_coef * value_manager_loss), "Value Manager loss")
-        #plt_loss.add_value(epoch, float(policy_loss), "Policy loss")
-        #plt_loss.add_value(epoch, float(args.value_worker_loss_coef * value_worker_loss), "Value Worker loss")
-        #plt_loss.add_value(epoch, float(manager_loss), "Manager loss")
-        #plt_loss.add_value(epoch, float(total_loss), "Total loss")
 
-        #plt_loss.draw()
+        with lock:
+            writer.add_scalars(
+                'data/loss' + str(rank),
+                {
+                    'manager': float(manager_loss),
+                    'worker': float(policy_loss),
+                    'total': float(total_loss),
+                },
+                epoch
+            )
+            writer.add_scalars(
+                'data/value_loss' + str(rank),
+                {
+                    'value_manager': float(value_manager_loss),
+                    'value_worker': float(value_worker_loss),
+                },
+                epoch
+            )
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 

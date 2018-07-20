@@ -36,7 +36,7 @@ if __name__ == "__main__":
     mp.set_start_method('spawn')
 
     args = Args(
-        lr=0.001,  # try LogUniform(1e-4.5, 1e-3.5)
+        lr=0.0003,  # try LogUniform(1e-4.5, 1e-3.5)
         alpha=0.8,
         entropy_coef=0,  # 0.01,
         tau_worker=1.00,
@@ -45,8 +45,8 @@ if __name__ == "__main__":
         num_steps=400,
         max_episode_length=1000000,
         max_grad_norm=40,
-        value_worker_loss_coef=0.5,
-        value_manager_loss_coef=0.5,
+        value_worker_loss_coef=1,
+        value_manager_loss_coef=1,
         seed=123,
         num_processes=4,
         no_shared=False,
@@ -69,12 +69,17 @@ if __name__ == "__main__":
     counter = mp.Value('i', 0)
     lock = mp.Lock()
 
-    p = mp.Process(target=test, args=(args.num_processes, shared_model, counter, args))
+    import socket
+    from datetime import datetime
+    current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+    log_dir = os.path.join('runs', current_time + '_' + socket.gethostname())
+
+    p = mp.Process(target=test, args=(args.num_processes, shared_model, counter, log_dir, lock, args))
     p.start()
     processes.append(p)
 
     for rank in range(0, args.num_processes):
-        p = mp.Process(target=train, args=(rank, shared_model, counter, lock, optimizer, args))
+        p = mp.Process(target=train, args=(rank, shared_model, counter, log_dir, lock, optimizer, args))
         p.start()
         processes.append(p)
     for p in processes:

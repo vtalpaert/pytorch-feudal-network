@@ -4,15 +4,18 @@ from itertools import count
 
 import torch
 
-from plot import Plotter
 from fun import FeudalNet
 from envs import create_atari_env
+
+from tensorboardX import SummaryWriter
 
 
 def test(
         rank,
         shared_model,
         counter,
+        log_dir,
+        lock,
         args):
     torch.manual_seed(args.seed + rank)
 
@@ -20,15 +23,14 @@ def test(
     env.seed(args.seed + rank)
     model = FeudalNet(env.observation_space, env.action_space, channel_first=True)
 
+    writer = SummaryWriter(log_dir=log_dir)
+
     model.eval()
 
     obs = env.reset()
     obs = torch.from_numpy(obs)
     done = True
     reward_sum = 0
-
-    plt_loss = Plotter("Loss", ylim_max=1000)
-    plt_reward = Plotter("Reward")
 
     start_time = time.time()
 
@@ -62,6 +64,12 @@ def test(
                               time.gmtime(time.time() - start_time)),
                 counter.value, counter.value / (time.time() - start_time),
                 reward_sum, episode_length))
+
+            with lock:
+                for name, param in shared_model.named_parameters():
+                    writer.add_histogram(name, param.clone().cpu().data.numpy(), epoch)
+                writer.add_scalar('data/reward', reward_sum, counter.value)
+
             reward_sum = 0
             episode_length = 0
             actions.clear()
