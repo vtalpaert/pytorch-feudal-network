@@ -12,7 +12,7 @@ from train import train
 from test import test
 
 
-parser = argparse.ArgumentParser(description='A3C')
+parser = argparse.ArgumentParser(description='Feudal Net with A3C setup')
 parser.add_argument('--lr', type=float, default=0.0003,  # try LogUniform(1e-4.5, 1e-3.5)
                     help='learning rate')
 parser.add_argument('--alpha', type=float, default=0.8,
