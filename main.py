@@ -1,5 +1,6 @@
 from collections import namedtuple
 import os
+import argparse
 
 import torch
 import torch.multiprocessing as mp
@@ -11,23 +12,37 @@ from train import train
 from test import test
 
 
-Args = namedtuple("Args", [
-    "lr",
-    "alpha",  # intrinsic reward multiplier
-    "entropy_coef",  # beta
-    "tau_worker",
-    "gamma_worker",
-    "gamma_manager",
-    "num_steps",
-    "max_episode_length",
-    "max_grad_norm",
-    "value_worker_loss_coef",
-    "value_manager_loss_coef",
-    "seed",
-    "num_processes",
-    "no_shared",
-    "env_name",
-])
+parser = argparse.ArgumentParser(description='A3C')
+parser.add_argument('--lr', type=float, default=0.0003,  # try LogUniform(1e-4.5, 1e-3.5)
+                    help='learning rate')
+parser.add_argument('--alpha', type=float, default=0.8,
+                    help='intrinsic reward multiplier')
+parser.add_argument('--gamma-worker', type=float, default=0.95,
+                    help='worker discount factor for rewards')
+parser.add_argument('--gamma-manager', type=float, default=0.99,
+                    help='manager discount factor for rewards')
+parser.add_argument('--tau-worker', type=float, default=1.00,
+                    help='parameter for GAE (worker only)')
+parser.add_argument('--entropy-coef', type=float, default=0.01,
+                    help='entropy term coefficient (also called beta)')
+parser.add_argument('--value-worker-loss-coef', type=float, default=1,
+                    help='worker value loss coefficient')
+parser.add_argument('--value-manager-loss-coef', type=float, default=1,
+                    help='manager value loss coefficient')
+parser.add_argument('--max-grad-norm', type=float, default=40,
+                    help='value loss coefficient')
+parser.add_argument('--seed', type=int, default=123,
+                    help='random seed')
+parser.add_argument('--num-processes', type=int, default=4,
+                    help='how many training processes to use')
+parser.add_argument('--num-steps', type=int, default=400,
+                    help='number of forward steps in A3C')
+parser.add_argument('--max-episode-length', type=int, default=1000000,
+                    help='maximum length of an episode')
+parser.add_argument('--env-name', default='PongDeterministic-v4',
+                    help='environment to train on (default: PongDeterministic-v4)')
+parser.add_argument('--no-shared', default=False,
+                    help='use an optimizer without shared momentum.')
 
 
 if __name__ == "__main__":
@@ -35,23 +50,7 @@ if __name__ == "__main__":
     os.environ['CUDA_VISIBLE_DEVICES'] = ""
     mp.set_start_method('spawn')
 
-    args = Args(
-        lr=0.0003,  # try LogUniform(1e-4.5, 1e-3.5)
-        alpha=0.8,
-        entropy_coef=0,  # 0.01,
-        tau_worker=1.00,
-        gamma_worker=0.95,
-        gamma_manager=0.99,
-        num_steps=400,
-        max_episode_length=1000000,
-        max_grad_norm=40,
-        value_worker_loss_coef=1,
-        value_manager_loss_coef=1,
-        seed=123,
-        num_processes=4,
-        no_shared=False,
-        env_name='PongDeterministic-v4',
-    )
+    args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     env = create_atari_env(args.env_name)
